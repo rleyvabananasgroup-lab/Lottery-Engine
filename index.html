@@ -515,8 +515,8 @@ async function generate(st, opts, onProgress) {
   }
   const counts = { generated: tries, duplicates: dup, evaluated: total, passStructural: pS, passMomentum: pM, passRelationship: pR, qualified: qualified.length, rejected: total - qualified.length };
   const get = i => Array.from(combos.subarray(i * 5, i * 5 + 5));
-  const portfolio = buildPortfolio(st, weights, { combos, sc, mo, stc, rl, total, qualified, get }, rng);
-  return { seed, counts, portfolio, thresholds: { structural: tS, momentum: tM, relationship: tR } };
+  const built = buildPortfolio(st, weights, { combos, sc, mo, stc, rl, total, qualified, get }, rng);
+  return { seed, counts, portfolio: built.tickets, optimization: built.optimization, thresholds: { structural: tS, momentum: tM, relationship: tR } };
 }
 
 function buildPortfolio(st, weights, pool, rng) {
@@ -540,19 +540,19 @@ function buildPortfolio(st, weights, pool, rng) {
       cand.sort((a, b) => sc[b] - sc[a]); cand = cand.slice(0, 3000);
       let best = -1, bv = -1e9;
       for (const i of cand) { const v = sc[i] - 6 * overlap(get(i)); if (v > bv) { bv = v; best = i; } }
-      seg.idx = best; seg.adj = bv;
+      seg.idx = best; seg.adj = bv; seg.pool = cand.slice(0, 300);
     } else {
       // experimental: uncommon profiles from the full (unfiltered) pool
       const shares = []; const sample = Math.min(total, 60000);
       for (let i = 0; i < sample; i++) shares.push(profileShare(st, feat(i)).pct);
       const sorted = shares.slice().sort((a, b) => a - b); const lim = quantile(sorted, 0.15);
-      let best = -1, bv = -1e9;
+      let best = -1, bv = -1e9; const pool = [];
       for (let i = 0; i < sample; i++) {
-        if (shares[i] > lim) continue;
+        if (shares[i] > lim) continue; pool.push(i);
         const v = (mo[i] + rl[i]) / 2 - 6 * overlap(get(i)); if (v > bv) { bv = v; best = i; }
       }
       if (best < 0) best = qualified[0];
-      seg.idx = best;
+      seg.idx = best; seg.pool = pool.sort((a, b) => (mo[b] + rl[b]) - (mo[a] + rl[a])).slice(0, 300);
     }
     const nums = get(seg.idx); nums.forEach(n => used.add(n));
     chosen.push({ profile: seg.name, profileId: seg.id, profileDesc: seg.desc, nums });
@@ -563,7 +563,46 @@ function buildPortfolio(st, weights, pool, rng) {
   for (let t = 0; t < 4; t++) { const s = ranked.find(x => !usedB.has(x.n)); chosen[t].special = s.n; chosen[t].specialWhy = `${GAMES[st.game].special} ${s.n}: momentum score ${s.score.toFixed(0)} (${s.row.win[20]}× in last 20 vs ${s.row.exp[20].toFixed(1)} expected)`; usedB.add(s.n); }
   const cold = st.spec.filter(x => !usedB.has(x.n)).sort((a, b) => b.gap - a.gap)[0];
   chosen[4].special = cold.n; chosen[4].specialWhy = `${GAMES[st.game].special} ${cold.n}: longest current absence (${cold.gap} drawings)`;
-  return chosen;
+
+  // Portfolio-level optimization: try replacing each ticket with other candidates from the same
+  // profile; keep a swap only when it raises the Portfolio Score of the whole set.
+  const cur = segs.map(sg => sg.idx);
+  const psOf = idx => portfolioScore(st, idx.map((i, k) => ({ nums: get(i), special: chosen[k].special })), idx.map(i => sc[i])).score;
+  const initial = psOf(cur); let best = initial; const swaps = [];
+  for (let pass = 0; pass < 3; pass++) {
+    let improved = false;
+    for (let k = 0; k < 5; k++) {
+      let bi = -1, bv = best;
+      for (const i of segs[k].pool || []) { if (cur.includes(i)) continue; const t = cur.slice(); t[k] = i; const v = psOf(t); if (v > bv + 0.05) { bv = v; bi = i; } }
+      if (bi >= 0) { swaps.push({ ticket: k + 1, profile: segs[k].name, from: get(cur[k]), to: get(bi), fromScore: sc[cur[k]], toScore: sc[bi], gain: bv - best }); cur[k] = bi; best = bv; improved = true; }
+    }
+    if (!improved) break;
+  }
+  cur.forEach((i, k) => { chosen[k].nums = get(i); });
+  return { tickets: chosen, optimization: { initial, final: best, swaps } };
+}
+
+// Portfolio Score, 0–100: how well the five tickets work together as a set by the engine's
+// criteria. A structural measure only; it is not a probability of winning.
+//   PS = 40%·Quality + 20%·Coverage + 15%·Sum spread + 15%·Structure variety + 10%·Bonus-ball variety
+//   Quality       = average Engine Score of the five tickets
+//   Coverage      = (different white balls − 5) ÷ 20 × 100    (25 different = 100; every repeat costs 5)
+//   Sum spread    = (highest sum − lowest sum) ÷ (90th − 10th percentile of past winning sums) × 100, capped at 100
+//   Structure     = (odd/even patterns − 1) + (low/mid/high patterns − 1) + (gap patterns − 1), ÷ 12 × 100
+//   Bonus variety = (different Powerballs / Mega Balls − 1) ÷ 4 × 100
+const PORTFOLIO_WEIGHTS = { quality: 40, coverage: 20, sumSpread: 15, structure: 15, bonus: 10 };
+function portfolioScore(st, tickets, scores) {
+  const m = portfolioMetrics(st, tickets);
+  const span = Math.max(1, st.sumQ[0.9] - st.sumQ[0.1]);
+  const parts = {
+    quality: scores.reduce((a, b) => a + b, 0) / scores.length,
+    coverage: 100 * (m.unique - 5) / 20,
+    sumSpread: 100 * Math.min(1, (m.sumMax - m.sumMin) / span),
+    structure: 100 * ((m.oddEven - 1) + (m.lmh - 1) + (m.gapPatterns - 1)) / 12,
+    bonus: 100 * (m.specials - 1) / 4,
+  };
+  let score = 0; for (const k in PORTFOLIO_WEIGHTS) score += PORTFOLIO_WEIGHTS[k] * clamp(parts[k], 0, 100) / 100;
+  return { score, parts, metrics: m };
 }
 
 function portfolioMetrics(st, tickets) {
@@ -803,13 +842,13 @@ function parseTicketText(raw, fallbackGame) {
 
 root.LIE = { GAMES, DEFAULT_WEIGHTS, WEIGHT_LABELS, WINDOWS, RESEARCH, eraFor, currentEra, dow, addDays, isDrawDay, nextDrawDate, latestExpectedDraw,
   missingDates, parseSnapshot, validateDraw, fromNYRow, fromMirrorCSV, mergeDraws, buildStats, components, weighted, evaluate, referenceScores,
-  percentileOf, gradeFor, generate, portfolioMetrics, checkPlay, ticketCost, tierName, backtest, features, profileShare, pad2, newSeed, nowET, parseTicketText };
+  percentileOf, gradeFor, generate, portfolioMetrics, portfolioScore, PORTFOLIO_WEIGHTS, checkPlay, ticketCost, tierName, backtest, features, profileShare, pad2, newSeed, nowET, parseTicketText };
 })(typeof window !== 'undefined' ? window : globalThis);
 </script>
 <script>(function () {
 'use strict';
 const L = window.LIE, G = L.GAMES;
-const APP_VERSION = '1.2';
+const APP_VERSION = '1.3';
 const KEY = 'lie.state.v1';
 const SOURCES = [
   ['engine', 'Lottery Intelligence Engine'], ['quick_pick', 'Lottery Quick Pick'], ['personal', 'Personal Selection'],
@@ -1179,7 +1218,7 @@ function vHome() {
       <div class="row small"><span class="status"><span class="dot ${st.dot}"></span>${esc(st.text)}</span><button class="btn quiet small" data-nav="data">Data status</button></div>
     </div>
     <button class="go" id="genBtn">GENERATE MY 5 TICKETS<small>${latestRun ? 'You already have a set for this drawing. This makes a new one.' : `For the ${fmtDate(next)} drawing`}</small></button>
-    ${latestRun ? `<button class="btn" data-nav="picks" data-arg="${latestRun.id}">View the set made ${fmtTime(latestRun.created)}</button>` : ''}
+    ${latestRun ? `<button class="btn" data-nav="picks" data-arg="${latestRun.id}">View the set made ${fmtTime(latestRun.created)}${latestRun.portfolioScore != null ? ` · Portfolio Score ${latestRun.portfolioScore.toFixed(0)}` : ''}</button>` : ''}
   </section>
   <nav class="menu" aria-label="Main">
     <button data-nav="tickets"><b>My Tickets</b><span>${S.tickets.filter(t => t.game === g && !t.deleted).length} saved for ${esc(gm.name)}</span></button>
@@ -1197,12 +1236,35 @@ vHome.after = () => { $('#genBtn').onclick = () => runGenerate(); };
 
 // ------------------------------------------------------------ GENERATE
 let genState = null;
+// Data freshness gate: tickets are only generated from data that includes the latest published
+// drawing, unless the person explicitly chooses to go ahead with older data.
+function freshnessDialog(g, ds) {
+  return new Promise(res => {
+    modal(`<h2>Latest results aren’t loaded</h2>
+      <p>The ${esc(G[g].name)} drawing on ${fmtDate(ds.expected, true)} should be published by now, but the app couldn’t retrieve it. The newest result on file is ${fmtDate(ds.last.d, true)}.</p>
+      <p class="small muted">${inClaude ? 'Ask Claude to “update my lottery app,” then tap Try again.' : 'Check the internet connection and tap Try again. Official results are sometimes posted late.'}</p>
+      <p class="small muted">If you go ahead anyway, the tickets will be built without that drawing and marked as made with older data.</p>
+      <div class="row" style="margin-top:14px"><button class="btn primary" id="fdRetry">Try again</button><button class="btn" id="fdGo">Use older data</button><button class="btn quiet" id="fdCancel">Cancel</button></div>`);
+    const done = v => { closeModal(); res(v); };
+    $('#fdRetry').onclick = () => done('retry'); $('#fdGo').onclick = () => done('override'); $('#fdCancel').onclick = () => done('cancel');
+    $('#layer .modal').addEventListener('click', e => { if (e.target.classList.contains('modal')) res('cancel'); });
+  });
+}
 async function runGenerate() {
-  const g = S.game; const target = L.nextDrawDate(g);
-  genState = { g, target, progress: 0, phase: 'Checking for new results…' }; go('picks', 'new');
-  if (dataStatus(g).behind) await refresh(g, false);
-  const ds = dataStatus(g);
-  genState.dataNote = ds.behind ? `Most recent available result is ${fmtDate(ds.last.d)}; ${fmtDate(ds.expected)} has not been retrieved. Tickets use data through ${fmtDate(ds.last.d)}.` : null;
+  const g = S.game;
+  let ds = dataStatus(g), override = false;
+  if (ds.behind) { toast('Checking for the latest results…'); await refresh(g, true); ds = dataStatus(g); }
+  while (ds.behind) {
+    const c = await freshnessDialog(g, ds);
+    if (c === 'cancel') return;
+    if (c === 'override') { override = true; break; }
+    toast('Checking again…'); await refresh(g, true); ds = dataStatus(g);
+    if (!ds.behind) toast('Latest results loaded.');
+  }
+  if (override) audit('generate', `${G[g].name} tickets generated with data through ${ds.last.d}; the ${ds.expected} drawing was missing (user override).`);
+  const target = L.nextDrawDate(g);
+  genState = { g, target, progress: 0, phase: 'Evaluating candidates…' }; go('picks', 'new');
+  genState.dataNote = override ? `Made with older data: the ${fmtDate(ds.expected, true)} drawing wasn’t available, so these tickets use results through ${fmtDate(ds.last.d, true)}.` : null;
   genState.phase = 'Evaluating candidates…'; render();
   const v = activeVersion(); const st = stats(g, target);
   const t0 = performance.now();
@@ -1213,10 +1275,14 @@ async function runGenerate() {
   const ref = refFor(st, v.weights);
   const tickets = res.portfolio.map(t => { const e = L.evaluate(st, v.weights, t.nums, t.special, ref);
     return { ...t, score: e.score, pct: e.pct, grade: e.grade, reasons: e.reasons.map(r => r.text), profileKey: e.profile.key, profilePct: e.profile.pct, specialScore: e.specialScore }; });
-  const run = { id: uid(), game: g, created: new Date().toISOString(), target, version: v.id, weights: { ...v.weights }, filters: { ...S.settings.filters },
-    cutoff: st.cutoff, historyCount: st.L, seed: res.seed, counts: res.counts, ms: Math.round(performance.now() - t0), tickets, metrics: L.portfolioMetrics(st, tickets), dataNote: genState.dataNote };
+  const ps = L.portfolioScore(st, tickets, tickets.map(t => t.score));
+  const seq = S.runs.filter(r => r.game === g && r.target === target).length + 1;
+  const pid = `${g.toUpperCase()}-${target.replace(/-/g, '')}-${String(seq).padStart(2, '0')}`;
+  const run = { id: uid(), pid, game: g, created: new Date().toISOString(), target, version: v.id, weights: { ...v.weights }, filters: { ...S.settings.filters },
+    cutoff: st.cutoff, historyCount: st.L, seed: res.seed, counts: res.counts, ms: Math.round(performance.now() - t0), tickets, metrics: L.portfolioMetrics(st, tickets), dataNote: genState.dataNote,
+    staleOverride: override, portfolioScore: ps.score, portfolioParts: ps.parts, portfolioWeights: { ...L.PORTFOLIO_WEIGHTS }, optimization: res.optimization };
   S.runs.push(run); if (S.runs.length > 300) S.runs.splice(0, S.runs.length - 300);
-  audit('generate', `${G[g].name} set for ${target} (engine ${v.id}, ${res.counts.evaluated.toLocaleString()} candidates, data through ${st.cutoff}).`);
+  audit('generate', `${G[g].name} portfolio ${pid} for ${target} (engine ${v.id}, ${res.counts.evaluated.toLocaleString()} candidates, data through ${st.cutoff}, Portfolio Score ${ps.score.toFixed(1)}).`);
   save(); genState = null; go('picks', run.id);
 }
 function vPicks() {
@@ -1227,10 +1293,13 @@ function vPicks() {
   const gm = G[run.game], m = run.metrics, c = run.counts;
   return `${back}
   <div class="row" style="justify-content:space-between;align-items:flex-end">
-    <div><h1>Your 5 ${esc(gm.name)} tickets</h1><p class="muted">For ${fmtDate(run.target, true)} · engine ${esc(run.version)} · data through ${fmtDate(run.cutoff)}</p></div>
+    <div><h1>Your 5 ${esc(gm.name)} tickets</h1><p class="muted">For ${fmtDate(run.target, true)} · engine ${esc(run.version)} · data through ${fmtDate(run.cutoff)}${run.pid ? ` · portfolio ${esc(run.pid)}` : ''}</p></div>
     <div class="row"><button class="btn primary" id="shotBtn">Screenshot view</button><button class="btn" id="newBtn">Generate a new set</button></div>
   </div>
   ${run.dataNote ? `<p class="note">${esc(run.dataNote)}</p>` : ''}
+  ${run.portfolioScore != null ? `<div class="panel section"><div class="row" style="justify-content:space-between;align-items:center">
+    <div><h3 style="margin:0">Portfolio Score</h3><p class="small muted" style="margin:2px 0 0">How well the five work together by the engine’s criteria. Not a chance of winning.</p></div>
+    <div style="font:700 40px/1 var(--display, inherit)">${run.portfolioScore.toFixed(0)}<span class="small muted">/100</span></div></div></div>` : ''}
   <div class="panel section">
     ${run.tickets.map((t, i) => `<div class="ticket">
       <div class="lbl">Ticket ${i + 1}<b>${esc(t.profile)}</b></div>
@@ -1249,7 +1318,8 @@ function vPicks() {
       <dt>Low/mid/high patterns</dt><dd>${m.lmh} different</dd>
       <dt>Gap patterns</dt><dd>${m.gapPatterns} different</dd>
       <dt>${esc(gm.special)}s</dt><dd>${m.specials} different</dd>
-      <dt>Average score</dt><dd>${(run.tickets.reduce((a, t) => a + t.score, 0) / 5).toFixed(1)}</dd></dl></div>
+      <dt>Average score</dt><dd>${(run.tickets.reduce((a, t) => a + t.score, 0) / 5).toFixed(1)}</dd></dl>
+      ${run.portfolioParts ? portfolioDetail(run) : ''}</div>
     <div class="panel"><h3>Candidates evaluated</h3><dl class="kv small" style="margin-top:8px">
       <dt>Evaluated</dt><dd>${c.evaluated.toLocaleString()} unique (${c.duplicates.toLocaleString()} duplicates skipped)</dd>
       <dt>Passed structural filter</dt><dd>${c.passStructural.toLocaleString()}</dd>
@@ -1267,11 +1337,21 @@ vPicks.after = () => {
   $('#newBtn') && ($('#newBtn').onclick = () => { S.game = run.game; runGenerate(); });
   $('#boughtBtn') && ($('#boughtBtn').onclick = () => boughtDialog(run));
 };
+function portfolioDetail(run) {
+  const P = run.portfolioParts, W = run.portfolioWeights || L.PORTFOLIO_WEIGHTS, o = run.optimization;
+  const rows = [['quality', 'Ticket quality (average Engine Score)'], ['coverage', 'Number coverage (25 different = 100)'], ['sumSpread', 'Spread of sums'], ['structure', 'Variety of odd/even, low/mid/high and gap patterns'], ['bonus', `Different ${G[run.game].special}s`]];
+  return `<details style="margin-top:10px"><summary class="small">How the Portfolio Score is calculated</summary>
+    <table class="small" style="margin-top:6px"><tr><th>Part</th><th>Weight</th><th>Score</th></tr>
+    ${rows.map(([k, n]) => `<tr><td>${esc(n)}</td><td>${W[k]}%</td><td>${Math.max(0, Math.min(100, P[k])).toFixed(0)}</td></tr>`).join('')}</table>
+    <p class="small muted">Portfolio Score = the weighted average of the five parts. Sum spread compares the lowest-to-highest ticket sum with the middle 80% of past winning sums.</p>
+    ${o ? (o.swaps.length ? `<p class="small muted">Optimization: the first set scored ${o.initial.toFixed(1)}. ${o.swaps.length} swap${o.swaps.length > 1 ? 's' : ''} raised it to ${o.final.toFixed(1)}:</p><ul class="small muted">${o.swaps.map(w => `<li>Ticket ${w.ticket} (${esc(w.profile)}): ${w.from.map(p2).join(' ')} → ${w.to.map(p2).join(' ')}. Engine Score ${w.fromScore.toFixed(0)} → ${w.toScore.toFixed(0)}; set +${w.gain.toFixed(1)}.</li>`).join('')}</ul>`
+      : `<p class="small muted">Optimization: no single-ticket swap improved the set (score ${o.final.toFixed(1)}).</p>`) : ''}</details>`;
+}
 function showShot(run) {
   const gm = G[run.game]; const layer = $('#layer');
   layer.innerHTML = `<div class="overlay" role="dialog" aria-label="Tickets for screenshot"><div class="shot">
     <div class="row noprint" style="justify-content:space-between;margin-bottom:10px"><button class="btn" id="closeShot">Close</button><button class="btn" id="printShot">Print</button></div>
-    <h2>${esc(gm.name)}</h2><p class="muted" style="margin:0 0 6px">${fmtDate(run.target, true)}</p>
+    <h2>${esc(gm.name)}</h2><p class="muted" style="margin:0 0 6px">${fmtDate(run.target, true)}${run.pid ? ` · ${esc(run.pid)}` : ''}${run.portfolioScore != null ? ` · Portfolio Score ${run.portfolioScore.toFixed(0)}` : ''}</p>
     ${run.tickets.map((t, i) => `<div class="t"><span class="n">${i + 1}</span>${ballsHTML(t.nums, t.special, { size: 'lg', game: run.game })}</div>`).join('')}
     <p class="faint small" style="margin-top:14px">Lottery Intelligence Engine ${esc(run.version)} · data through ${fmtDate(run.cutoff)} · selections do not change the odds.</p></div></div>`;
   document.body.dataset.game = run.game;
