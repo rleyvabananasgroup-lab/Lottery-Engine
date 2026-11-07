@@ -848,7 +848,7 @@ root.LIE = { GAMES, DEFAULT_WEIGHTS, WEIGHT_LABELS, WINDOWS, RESEARCH, eraFor, c
 <script>(function () {
 'use strict';
 const L = window.LIE, G = L.GAMES;
-const APP_VERSION = '1.3';
+const APP_VERSION = '1.4';
 const KEY = 'lie.state.v1';
 const SOURCES = [
   ['engine', 'Lottery Intelligence Engine'], ['quick_pick', 'Lottery Quick Pick'], ['personal', 'Personal Selection'],
@@ -1147,17 +1147,65 @@ function upcomingDates(g, n) { const out = []; let d = L.nextDrawDate(g); while 
 function recentDates(g, n) { return draws(g).slice(-n).map(r => r.d).reverse(); }
 
 // ------------------------------------------------------------ evaluation & checking
+// A ticket's first evaluation is permanent (t.eval). Later re-scoring with another engine version
+// is added to t.rescores and never replaces it.
+const COMP = [['m20', 'Last-20 momentum', 'm20'], ['m50', 'Last-50 momentum', 'm50'], ['struct', 'Structure', 'structural'], ['rel', 'Number relationships', 'relationship'], ['lt', 'Long-term frequency', 'historical']];
+function compareWithEngine(st, weights, ref, play, mine, engTickets, label) {
+  const sumOf = a => a.reduce((x, y) => x + y, 0); const s0 = sumOf(play.w);
+  const et = engTickets.slice().sort((a, b) => Math.abs(sumOf(a.nums) - s0) - Math.abs(sumOf(b.nums) - s0))[0];
+  const e = L.evaluate(st, weights, et.nums, et.special, ref);
+  const tw = Object.keys(L.DEFAULT_WEIGHTS).reduce((a, k) => a + (weights[k] || 0), 0) || 1;
+  const parts = COMP.map(([k, name, f]) => ({ k, name, mine: mine[f], engine: e[f], effect: (weights[k] || 0) * (mine[f] - e[f]) / tw }));
+  return { engineNums: et.nums.slice(), engineSpecial: et.special, engineProfile: et.profile || null, engineScore: e.score, diff: mine.score - e.score, parts, source: label };
+}
 function evaluateTicket(t) {
   const st = stats(t.game, t.drawDate); const v = activeVersion(); const ref = refFor(st, v.weights);
   const runs = S.runs.filter(r => r.game === t.game && r.target === t.drawDate);
   const recNums = runs.length ? runs[runs.length - 1].tickets : null;
-  t.eval = { version: v.id, cutoff: st.cutoff, at: new Date().toISOString(), plays: t.plays.map(p => {
+  const lastRun = runs.length ? runs[runs.length - 1] : null;
+  if (t.source === 'engine_modified' && t.origin && !t.originRec) {
+    const [rid, ix] = String(t.origin).split(':'); const r = S.runs.find(x => x.id === rid); const ot = r && r.tickets[+ix];
+    if (ot) {
+      const e0 = L.evaluate(st, v.weights, ot.nums, ot.special, ref); const p0 = t.plays[0];
+      t.originRec = { runId: r.id, pid: r.pid || null, ticket: +ix + 1, profile: ot.profile, target: r.target, nums: ot.nums.slice(), special: ot.special,
+        generatedScore: ot.score, generatedVersion: r.version, score: e0.score,
+        removed: ot.nums.filter(n => !p0.w.includes(n)), added: p0.w.filter(n => !ot.nums.includes(n)), specialChanged: ot.special !== p0.b };
+    }
+  }
+  t.eval = { version: v.id, weights: { ...v.weights }, cutoff: st.cutoff, at: new Date().toISOString(), plays: t.plays.map(p => {
     const e = L.evaluate(st, v.weights, p.w, p.b, ref);
     let compat = null;
     if (recNums) { const mo = Math.max(...recNums.map(r => r.nums.filter(n => p.w.includes(n)).length)); compat = 100 - mo * 20; }
-    return { score: e.score, pct: e.pct, grade: e.grade, momentum: e.momentum, structural: e.structural, relationship: e.relationship, historical: e.historical,
-      gapScore: e.gapScore, rangeScore: e.rangeScore, specialScore: e.specialScore, compat, profile: e.profile.key, profilePct: e.profile.pct, reasons: e.reasons.map(r => r.text) };
+    const out = { score: e.score, pct: e.pct, grade: e.grade, momentum: e.momentum, structural: e.structural, relationship: e.relationship, historical: e.historical,
+      m20: e.m20, m50: e.m50, gapScore: e.gapScore, rangeScore: e.rangeScore, specialScore: e.specialScore, compat, profile: e.profile.key, profilePct: e.profile.pct, reasons: e.reasons.map(r => r.text) };
+    if (recNums && t.source !== 'engine') out.beat = compareWithEngine(st, v.weights, ref, p, out, recNums, `portfolio ${lastRun.pid || 'generated ' + fmtTime(lastRun.created)}`);
+    return out;
   }), engineAvg: recNums ? recNums.reduce((a, r) => a + r.score, 0) / recNums.length : null };
+  if (t.originRec) t.eval.originScore = t.originRec.score;
+}
+function rescoreTicket(t) {
+  const st = stats(t.game, t.drawDate); const v = activeVersion(); const ref = refFor(st, v.weights);
+  const r = { version: v.id, weights: { ...v.weights }, cutoff: st.cutoff, at: new Date().toISOString(), plays: t.plays.map(p => { const e = L.evaluate(st, v.weights, p.w, p.b, ref); return { score: e.score, grade: e.grade, pct: e.pct }; }) };
+  (t.rescores = t.rescores || []).push(r);
+  audit('ticket', `Re-scored ${G[t.game].name} ${t.drawDate} ticket with engine ${v.id}: ${r.plays.map((x, i) => `${t.eval.plays[i].score.toFixed(1)} → ${x.score.toFixed(1)}`).join(', ')} (original scores kept).`);
+}
+// Build the engine's comparison set for a drawing that has no generated set, using only earlier data.
+async function buildEngineComparison(t) {
+  const st = stats(t.game, t.drawDate); const v = S.versions.find(x => x.id === t.eval.version) || activeVersion(); const ref = refFor(st, v.weights);
+  const res = await L.generate(st, { weights: v.weights, count: 50000, filters: S.settings.filters });
+  const eng = res.portfolio.map(x => ({ ...x, score: L.evaluate(st, v.weights, x.nums, x.special, ref).score }));
+  t.eval.plays.forEach((pe, i) => { pe.beat = compareWithEngine(st, v.weights, ref, t.plays[i], pe, eng, `a set built for this comparison (engine ${v.id}, 50,000 candidates, data through ${fmtDate(st.cutoff)})`); });
+  audit('ticket', `Built an engine comparison set for a ${G[t.game].name} ${t.drawDate} ticket (engine ${v.id}).`);
+}
+// Hypothetical result of numbers that weren't bought (base prizes, no add-ons). Never counted as money.
+function hypothetical(g, nums, special, d) { return L.checkPlay(g, { w: nums, b: special, mult: null }, d, { powerPlay: false, doublePlay: false, megaplier: false, ticketMult: null }); }
+function runPurchase(run) {
+  const linked = S.tickets.filter(t => !t.deleted && (t.runId === run.id || String(t.origin || '').startsWith(run.id + ':')));
+  const plays = linked.reduce((a, t) => a + t.plays.length, 0);
+  if (linked.length) return { key: 'purchased', label: `Purchased (${plays} play${plays > 1 ? 's' : ''} saved)`, dot: 'ok' };
+  if (run.purchase === 'not_purchased') return { key: 'not_purchased', label: 'Not purchased', dot: '' };
+  if (run.target < L.nextDrawDate(run.game)) return { key: 'unconfirmed', label: 'Purchase unconfirmed', dot: 'warn' };
+  return { key: 'generated', label: 'Generated', dot: '' };
 }
 function checkTicket(t) {
   const d = draws(t.game).find(r => r.d === t.drawDate);
@@ -1217,6 +1265,7 @@ function vHome() {
       </div>
       <div class="row small"><span class="status"><span class="dot ${st.dot}"></span>${esc(st.text)}</span><button class="btn quiet small" data-nav="data">Data status</button></div>
     </div>
+    ${(() => { const n = S.runs.filter(r => r.game === g && runPurchase(r).key === 'unconfirmed').length; return n ? `<button class="btn quiet small" data-nav="tickets"><span class="dot warn"></span> ${n} generated set${n > 1 ? 's' : ''} waiting for you to confirm whether you bought ${n > 1 ? 'them' : 'it'}</button>` : ''; })()}
     <button class="go" id="genBtn">GENERATE MY 5 TICKETS<small>${latestRun ? 'You already have a set for this drawing. This makes a new one.' : `For the ${fmtDate(next)} drawing`}</small></button>
     ${latestRun ? `<button class="btn" data-nav="picks" data-arg="${latestRun.id}">View the set made ${fmtTime(latestRun.created)}${latestRun.portfolioScore != null ? ` · Portfolio Score ${latestRun.portfolioScore.toFixed(0)}` : ''}</button>` : ''}
   </section>
@@ -1305,10 +1354,13 @@ function vPicks() {
       <div class="lbl">Ticket ${i + 1}<b>${esc(t.profile)}</b></div>
       <div>${ballsHTML(t.nums, t.special, { game: run.game })}
         <details><summary>Engine score ${t.score.toFixed(0)} · higher than ${t.pct.toFixed(0)}% of random tickets · why</summary><ul>
-          <li>${esc(t.profileDesc)}</li>${t.reasons.map(r => `<li>${esc(r)}</li>`).join('')}<li>${esc(t.specialWhy)}</li></ul></details></div>
+          <li>${esc(t.profileDesc)}</li>${t.reasons.map(r => `<li>${esc(r)}</li>`).join('')}<li>${esc(t.specialWhy)}</li></ul>
+          <button class="btn quiet small" data-mod="${i}">Change this ticket’s numbers</button></details></div>
       <div class="grade ${t.grade}" title="Grade">${t.grade}</div></div>`).join('')}
   </div>
-  <div class="row section"><button class="btn" id="boughtBtn">I bought these tickets</button><span class="small muted">Saves them to My Tickets so they’re checked automatically after the drawing.</span></div>
+  ${(() => { const ps = runPurchase(run); return `<div class="section"><p class="status small"><span class="dot ${ps.dot}"></span>Status: <b>${esc(ps.label)}</b></p>
+  <div class="row"><button class="btn" id="boughtBtn">I bought these tickets</button>${ps.key === 'purchased' ? '' : ps.key === 'not_purchased' ? `<button class="btn quiet" id="undoNP">Undo “not purchased”</button>` : `<button class="btn quiet" id="notBought">I didn’t buy these</button>`}</div>
+  <p class="small muted">Only tickets you mark as bought count as money spent or won. To buy a changed version of a ticket, open its “why” section and tap “Change this ticket’s numbers.”</p></div>`; })()}
   <div class="grid2 section">
     <div class="panel"><h3>How the five work together</h3><dl class="kv small" style="margin-top:8px">
       <dt>Different white balls</dt><dd>${m.unique} of 25 (${m.coverage.toFixed(0)}% of 1–${L.eraFor(run.game, run.target).wMax})</dd>
@@ -1336,6 +1388,13 @@ vPicks.after = () => {
   $('#shotBtn') && ($('#shotBtn').onclick = () => showShot(run));
   $('#newBtn') && ($('#newBtn').onclick = () => { S.game = run.game; runGenerate(); });
   $('#boughtBtn') && ($('#boughtBtn').onclick = () => boughtDialog(run));
+  $('#notBought') && ($('#notBought').onclick = () => { run.purchase = 'not_purchased'; audit('generate', `Portfolio ${run.pid || run.id} marked not purchased.`); save(); render(); });
+  $('#undoNP') && ($('#undoNP').onclick = () => { delete run.purchase; save(); render(); });
+  document.querySelectorAll('[data-mod]').forEach(b => b.onclick = () => {
+    const i = +b.dataset.mod, tk = run.tickets[i];
+    scanDraft = { ...newDraft(), game: run.game, drawDate: run.target, plays: [{ w: tk.nums.slice(), b: tk.special, mult: '' }], source: 'engine_modified', origin: `${run.id}:${i}` };
+    S.game = run.game; go('scan'); toast('Change the numbers you want, then save.');
+  });
 };
 function portfolioDetail(run) {
   const P = run.portfolioParts, W = run.portfolioWeights || L.PORTFOLIO_WEIGHTS, o = run.optimization;
@@ -1398,9 +1457,26 @@ function vTickets() {
       <div>${t.plays.map((p, i) => `<div style="margin:3px 0">${ballsHTML(p.w, p.b, { size: 'sm', game: g, hit: d ? d.w : [], hitB: d && d.b === p.b })}${t.eval ? ` <span class="small muted">${t.eval.plays[i].score.toFixed(0)}</span>` : ''}</div>`).join('')}
         <div class="small muted">${statusText(t)} · ${money(t.cost)} · ${esc(entryName(t.entry))}</div></div>
       <div class="grade ${t.eval ? t.eval.plays[0].grade : ''}">${t.eval ? t.eval.plays[0].grade : '–'}</div></div>`; }).join('')}</div>` :
-    `<div class="panel section"><p>No ${esc(G[g].name)} tickets saved yet.</p><p class="muted small">After you buy tickets, photograph them or type them in. They’ll be checked automatically once results are published.</p></div>`}`;
+    `<div class="panel section"><p>No ${esc(G[g].name)} tickets saved yet.</p><p class="muted small">After you buy tickets, photograph them or type them in. They’ll be checked automatically once results are published.</p></div>`}
+  ${generatedSetsHTML(g)}`;
 }
-vTickets.after = app => app.querySelectorAll('[data-tid]').forEach(el => el.onclick = () => ticketDetail(el.dataset.tid));
+function generatedSetsHTML(g) {
+  const runs = S.runs.filter(r => r.game === g).slice(-30).reverse(); if (!runs.length) return '';
+  return `<h2 class="section">Generated sets</h2><p class="small muted">Every set the engine made, whether or not you bought it. Results for sets you didn’t buy are hypothetical and never counted as money spent or won.</p>
+  <div class="panel">${runs.map(r => { const ps = runPurchase(r); const d = draws(g).find(x => x.d === r.target);
+    let res = '';
+    if (d && ps.key !== 'purchased') { const hs = r.tickets.map(t => hypothetical(g, t.nums, t.special, d)); const best = hs.reduce((a, h) => (h.wm + (h.bm ? 0.5 : 0) > a.wm + (a.bm ? 0.5 : 0) ? h : a), hs[0]); const amt = hs.reduce((a, h) => a + h.amount, 0);
+      res = ` · best match ${best.wm}${best.bm ? ' + ' + G[g].specialShort : ''}${amt ? ` · would have won ${money(amt)} (hypothetical)` : ' · no prize (hypothetical)'}`; }
+    return `<div class="row" style="justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--line)">
+      <div><b>${esc(r.pid || 'Set')}</b> <span class="small muted">· ${fmtDate(r.target)}${r.portfolioScore != null ? ` · Portfolio ${r.portfolioScore.toFixed(0)}` : ''}</span><br>
+        <span class="status small"><span class="dot ${ps.dot}"></span>${esc(ps.label)}${res}</span></div>
+      <div class="row">${ps.key === 'unconfirmed' || ps.key === 'generated' ? `<button class="btn small" data-buy="${r.id}">Bought</button><button class="btn quiet small" data-nb="${r.id}">Not bought</button>` : ''}<button class="btn quiet small" data-nav="picks" data-arg="${r.id}">Open</button></div></div>`; }).join('')}</div>`;
+}
+vTickets.after = app => {
+  app.querySelectorAll('[data-tid]').forEach(el => el.onclick = () => ticketDetail(el.dataset.tid));
+  app.querySelectorAll('[data-buy]').forEach(b => b.onclick = () => { const r = S.runs.find(x => x.id === b.dataset.buy); if (r) boughtDialog(r); });
+  app.querySelectorAll('[data-nb]').forEach(b => b.onclick = () => { const r = S.runs.find(x => x.id === b.dataset.nb); if (!r) return; r.purchase = 'not_purchased'; audit('generate', `Portfolio ${r.pid || r.id} marked not purchased.`); save(); render(); });
+};
 function ticketDetail(id) {
   const t = S.tickets.find(x => x.id === id); if (!t) return; const g = t.game, gm = G[g], era = L.eraFor(g, t.drawDate);
   const d = draws(g).find(r => r.d === t.drawDate); const photo = t.photo ? photoGet(t.photo) : null;
@@ -1419,6 +1495,9 @@ function ticketDetail(id) {
           <dt>Portfolio fit</dt><dd>${e.compat != null ? e.compat + ' (100 = shares no numbers with the engine’s set)' : 'No engine set for this drawing'}</dd>
           <dt>Profile</dt><dd>${esc(e.profile)} — ${e.profilePct.toFixed(1)}% of past drawings</dd></dl>
           <details><summary>Why</summary><ul>${e.reasons.map(x => `<li>${esc(x)}</li>`).join('')}</ul></details>` : ''}</div>`; }).join('')}
+    ${t.eval ? scoreHistoryHTML(t) : ''}
+    ${t.originRec ? modifiedHTML(t, d) : ''}
+    ${t.eval && t.source !== 'engine' && !t.originRec ? beatHTML(t) : ''}
     ${t.eval ? `<p class="small muted" style="margin-top:10px">Scored by engine ${esc(t.eval.version)} using only drawings through ${fmtDate(t.eval.cutoff)}.${t.eval.engineAvg != null ? ` The engine’s own set for this drawing averaged ${t.eval.engineAvg.toFixed(1)}.` : ''}</p>` : ''}
     ${photo ? `<details><summary>Original photo</summary><img src="${photo}" alt="Ticket photo" style="max-width:100%;border-radius:10px;margin-top:8px"></details>` : ''}
     <label for="vPrize">Prize confirmed by the lottery (optional)</label>
@@ -1426,7 +1505,47 @@ function ticketDetail(id) {
     <div class="row" style="margin-top:16px"><button class="btn quiet" id="tDel" style="color:var(--bad)">Remove ticket</button></div>`);
   document.querySelectorAll('[data-mult]').forEach(s => s.onchange = () => { const v = s.value ? +s.value : null; t.plays[+s.dataset.mult].mult = v; checkTicket(t); audit('ticket', `Multiplier ${v || 'cleared'} recorded for a ${gm.name} ${t.drawDate} play.`); save(); ticketDetail(id); });
   $('#vSave').onclick = () => { const v = $('#vPrize').value; const old = t.verifiedPrize; t.verifiedPrize = v === '' ? null : +v; audit('ticket', `Verified prize for ${gm.name} ${t.drawDate} ticket set to ${v === '' ? 'none' : '$' + v} (was ${old ?? 'none'}).`); save(); toast('Saved.'); ticketDetail(id); render(); };
+  $('#tRescore') && ($('#tRescore').onclick = () => { rescoreTicket(t); save(); toast('Re-scored. The original score is kept.'); ticketDetail(id); });
+  $('#tBeat') && ($('#tBeat').onclick = async () => { $('#tBeat').disabled = true; $('#tBeat').textContent = 'Building the engine’s set…'; await new Promise(r => setTimeout(r, 30)); await buildEngineComparison(t); save(); ticketDetail(id); });
   $('#tDel').onclick = () => { if (!confirm('Remove this ticket? It stays in your backup history but leaves all totals.')) return; t.deleted = new Date().toISOString(); audit('ticket', `Removed ${gm.name} ${t.drawDate} ticket.`); save(); closeModal(); render(); };
+}
+
+function scoreHistoryHTML(t) {
+  const last = t.rescores && t.rescores[t.rescores.length - 1]; const v = activeVersion();
+  return `<div class="panel" style="margin-top:10px"><h3 style="margin:0 0 6px">Engine Score history</h3>
+    ${t.plays.map((p, i) => { const o = t.eval.plays[i], c = last && last.plays[i];
+      return `<p class="small" style="margin:4px 0">${t.plays.length > 1 ? `Play ${String.fromCharCode(65 + i)}: ` : ''}<b>Original:</b> ${o.score.toFixed(1)} — engine ${esc(t.eval.version)}${c ? ` · <b>Current:</b> ${c.score.toFixed(1)} — engine ${esc(last.version)} · <b>Difference:</b> ${(c.score - o.score >= 0 ? '+' : '')}${(c.score - o.score).toFixed(1)}` : ''}</p>`; }).join('')}
+    <p class="small muted">The original score, weights (${Object.values(t.eval.weights || (S.versions.find(x => x.id === t.eval.version) || v).weights).join('/')}), data cutoff and profile are kept permanently. Re-scoring uses the same pre-drawing data with the active engine (${esc(v.id)}).${t.rescores && t.rescores.length > 1 ? ` Re-scored ${t.rescores.length} times; all are kept in the record.` : ''}</p>
+    <button class="btn quiet small" id="tRescore">Re-score with engine ${esc(v.id)}</button></div>`;
+}
+function modifiedHTML(t, d) {
+  const o = t.originRec, gm = G[t.game], p0 = t.plays[0]; const mine = t.eval.plays[0].score;
+  let outcome = '';
+  if (d) { const orig = hypothetical(t.game, o.nums, o.special, d); const mr = t.result && t.result.plays && t.result.plays[0];
+    outcome = `<p class="small"><b>After the drawing:</b> your changed ticket matched ${mr ? mr.wm : '–'}${mr && mr.bm ? ' + ' + gm.specialShort : ''}${mr ? ` (${mr.amount ? money(mr.amount) : 'no prize'})` : ''}. The original recommendation would have matched ${orig.wm}${orig.bm ? ' + ' + gm.specialShort : ''} (${orig.amount ? money(orig.amount) : 'no prize'}, hypothetical, base prize).</p>`; }
+  return `<div class="panel" style="margin-top:10px"><h3 style="margin:0 0 6px">Changed from an engine ticket</h3>
+    <p class="small">Original: ticket ${o.ticket} (${esc(o.profile)}) of ${esc(o.pid || 'a generated set')} — ${ballsHTML(o.nums, o.special, { size: 'sm', game: t.game })}</p>
+    <p class="small">Numbers changed: ${o.removed.length ? `removed ${o.removed.map(p2).join(', ')}; added ${o.added.map(p2).join(', ')}` : 'white balls unchanged'}${o.specialChanged ? `; ${esc(gm.special)} ${p2(o.special)} → ${p2(p0.b)}` : ''}.</p>
+    <p class="small">Engine Score: original ${o.score.toFixed(1)} → yours ${mine.toFixed(1)} (${(mine - o.score >= 0 ? '+' : '')}${(mine - o.score).toFixed(1)}), same engine and data.</p>
+    ${o.target !== t.drawDate ? `<p class="small" style="color:var(--warn)">Note: the original set was made for ${fmtDate(o.target)}, a different drawing.</p>` : ''}
+    ${outcome}<p class="small muted">Only the ticket you bought counts toward your spending and winnings.</p></div>`;
+}
+function beatHTML(t) {
+  const has = t.eval.plays.some(pe => pe.beat);
+  if (!has) return `<div class="panel" style="margin-top:10px"><h3 style="margin:0 0 6px">Beat the Engine</h3>
+    <p class="small muted">No engine set was generated for this drawing. The app can build one now using only results from before the drawing, then compare.</p>
+    <button class="btn small" id="tBeat">Compare with the engine</button></div>`;
+  return `<div class="panel" style="margin-top:10px"><h3 style="margin:0 0 6px">Beat the Engine</h3>
+    ${t.eval.plays.map((pe, i) => { const b = pe.beat; if (!b) return ''; const top = b.parts.slice().sort((x, y) => Math.abs(y.effect) - Math.abs(x.effect)).slice(0, 3);
+      return `<div style="margin:8px 0"><dl class="kv small">
+        <dt>${t.plays.length > 1 ? `Play ${String.fromCharCode(65 + i)}` : 'Your ticket'}</dt><dd>${ballsHTML(t.plays[i].w, t.plays[i].b, { size: 'sm', game: t.game })}</dd>
+        <dt>Ticket source</dt><dd>${esc(srcName(t.source))}</dd>
+        <dt>Engine Score</dt><dd>${pe.score.toFixed(1)}</dd>
+        <dt>Comparable engine ticket</dt><dd>${ballsHTML(b.engineNums, b.engineSpecial, { size: 'sm', game: t.game })}${b.engineProfile ? ` <span class="muted">${esc(b.engineProfile)}</span>` : ''}</dd>
+        <dt>Its Engine Score</dt><dd>${b.engineScore.toFixed(1)}</dd>
+        <dt>Difference</dt><dd><b>${(b.diff >= 0 ? '+' : '')}${b.diff.toFixed(1)}</b> ${b.diff >= 0 ? '(yours scores higher)' : '(the engine’s scores higher)'}</dd></dl>
+        <p class="small muted">Main reasons: ${top.map(x => `${esc(x.name)} ${x.effect >= 0 ? '+' : ''}${x.effect.toFixed(1)} (yours ${x.mine.toFixed(0)} vs ${x.engine.toFixed(0)})`).join('; ')}.</p></div>`; }).join('')}
+    <p class="small muted">Compared with the engine ticket closest in total sum from ${esc((t.eval.plays.find(pe => pe.beat) || {}).beat.source)}. A higher Engine Score means a closer fit to the engine’s criteria, not better odds.</p></div>`;
 }
 
 // ------------------------------------------------------------ SCAN / ADD
@@ -1636,7 +1755,7 @@ function vPerformance() {
     ${all.pending ? `<p class="note">${all.pending} ticket(s) have prizes pending verification and aren’t fully counted yet.</p>` : ''}
     <div class="panel section"><h3>By number source</h3><div class="scroll"><table><thead><tr><th>Source</th><th>Plays</th><th>Spent</th><th>Won</th><th>Net</th><th>ROI</th><th>Win %</th><th>Largest</th></tr></thead><tbody>
       ${by.map(x => `<tr><td>${esc(x.n)}</td><td>${x.s.plays}</td><td>${money(x.s.spent)}</td><td>${money(x.s.won)}</td><td>${money(x.s.net)}</td><td>${x.s.roi == null ? '—' : x.s.roi.toFixed(0) + '%'}</td><td>${x.s.winPct == null ? '—' : x.s.winPct.toFixed(1)}</td><td>${money(x.s.max)}</td></tr>`).join('')}
-    </tbody></table></div><p class="small faint">Each source is kept separate. Small samples swing widely; differences between sources over a few dozen plays are almost always luck.</p></div>
+    </tbody></table></div><p class="small faint">Each source is kept separate. Small samples swing widely; differences between sources over a few dozen plays are almost always luck. Generated sets you didn’t buy are never counted here; their hypothetical results are under My Tickets → Generated sets.</p></div>
     <div class="panel"><h3>Cumulative spending and winnings</h3><div class="chartbox"><canvas id="cum"></canvas></div></div>` :
   `<div class="panel section"><p>No purchased ${esc(G[g].name)} tickets in this period.</p><p class="small muted">Generated tickets don’t count as money spent until you mark them as bought.</p></div>`}`;
 }

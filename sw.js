@@ -1,6 +1,6 @@
 // Offline support for the installed app. The app itself and its results file are always
 // fetched fresh when there's a connection and served from the phone's cache when there isn't.
-const VERSION = 'lie-1.3.0';
+const VERSION = 'lie-1.4.0';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './data/feed.json',
   './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];
 const CDN = /^https:\/\/(cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net|fonts\.googleapis\.com|fonts\.gstatic\.com|tessdata\.projectnaptha\.com)\//;
