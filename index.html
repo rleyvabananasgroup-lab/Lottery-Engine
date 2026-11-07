@@ -1086,7 +1086,7 @@ function dataStatus(g) {
 const $ = (s, el = document) => el.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const money = (n, d = 0) => n == null ? '—' : (n < 0 ? '−$' : '$') + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
-function fmtDate(d, long) { if (!d) return '—'; const x = new Date(d + 'T12:00:00Z'); return x.toLocaleDateString('en-US', { timeZone: 'UTC', weekday: long ? 'long' : 'short', month: 'short', day: 'numeric', year: long ? 'numeric' : undefined }); }
+function fmtDate(d, long) { if (!d) return '—'; const x = new Date(d + 'T12:00:00Z'); return x.toLocaleDateString('en-US', { timeZone: 'UTC', weekday: long ? 'long' : 'short', month: 'short', day: 'numeric', year: (long || Math.abs(x - Date.now()) > 300 * 864e5) ? 'numeric' : undefined }); }
 function fmtTime(iso) { if (!iso) return 'never'; const x = new Date(iso); return x.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); }
 const p2 = L.pad2;
 function ballsHTML(w, b, opts = {}) {
