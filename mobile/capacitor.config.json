@@ -1,0 +1,18 @@
+{
+  "appId": "io.github.rleyvabananasgrouplab.lotteryengine",
+  "appName": "Lottery Engine Test",
+  "webDir": "www",
+  "android": {
+    "backgroundColor": "#101A2A"
+  },
+  "ios": {
+    "backgroundColor": "#101A2A"
+  },
+  "plugins": {
+    "SystemBars": {
+      "insetsHandling": "css",
+      "initialViewportFitValueHint": "cover",
+      "style": "DARK"
+    }
+  }
+}
